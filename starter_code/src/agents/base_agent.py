@@ -1,168 +1,206 @@
 """
-Base agent class that all specialized agents inherit from.
+BaseAgent - shared lifecycle, event emission, and utilities for all agents.
 
-TODO: Implement the base agent with Claude API integration.
+- Agent lifecycle events
+- Thinking stream
+- Tool call scaffolding
+- Error handling
 """
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, Dict, List, Optional
-import anthropic
 
-from ..config import AgentConfig, config
-from ..events import Event, EventBus, EventType
-from ..events.event_types import (
-    create_agent_started_event,
-    create_thinking_event,
-    create_tool_call_start_event,
-    create_tool_call_result_event
-)
+from ..events import EventBus, EventType, Event
 
 
 class BaseAgent(ABC):
     """
     Abstract base class for all agents in the system.
 
-    Provides:
-    - Claude API client initialization
-    - Event publishing helpers
-    - Tool execution framework
-    - Streaming support
-
-    TODO: Complete the implementation
+    Responsibilities:
+    - Manage agent identity & configuration
+    - Emit lifecycle and observability events
+    - Provide helper methods for subclasses
     """
 
     def __init__(
         self,
         agent_id: str,
         agent_type: str,
-        agent_config: AgentConfig,
-        event_bus: EventBus
+        agent_config: Dict[str, Any],
+        event_bus: EventBus,
     ):
-        """
-        Initialize the base agent.
-
-        Args:
-            agent_id: Unique identifier for this agent instance
-            agent_type: Type of agent (coordinator, security, bug)
-            agent_config: Configuration for this agent
-            event_bus: Event bus for publishing events
-        """
         self.agent_id = agent_id
         self.agent_type = agent_type
-        self.config = agent_config
+        self.agent_config = agent_config
         self.event_bus = event_bus
 
-        # Initialize Claude client
-        self.client = anthropic.Anthropic(api_key=config.anthropic_api_key)
-
-        # Conversation history for multi-turn
-        self.messages: List[Dict[str, Any]] = []
-
-        # Tools available to this agent
-        self._tools: List[Dict[str, Any]] = []
+    # ---------------------------------------------------------------------
+    # Abstract API
+    # ---------------------------------------------------------------------
 
     @property
     @abstractmethod
     def system_prompt(self) -> str:
-        """Return the system prompt for this agent."""
-        pass
+        """System prompt describing this agent's role."""
+        raise NotImplementedError
 
     @abstractmethod
-    def get_tools(self) -> List[Dict[str, Any]]:
-        """Return the tools available to this agent."""
-        pass
-
-    @abstractmethod
-    async def analyze(self, code: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def analyze(
+        self,
+        code: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        Analyze code and return findings.
+        Main entry point for agent analysis.
 
         Args:
             code: The code to analyze
-            context: Optional context from other agents
+            context: Shared context from coordinator
 
         Returns:
-            Dictionary containing analysis results
+            Agent-specific results
         """
-        pass
+        raise NotImplementedError
 
-    def _publish_event(self, event: Event) -> None:
-        """Helper to publish events synchronously."""
-        self.event_bus.publish_sync(event)
+    def get_tools(self) -> List[Dict[str, Any]]:
+        """
+        Tools available to this agent (LLM tool calling).
 
-    async def _call_claude(
+        Default: no tools.
+        """
+        return []
+
+    # ---------------------------------------------------------------------
+    # Lifecycle & observability helpers
+    # ---------------------------------------------------------------------
+
+    async def _emit_event(
         self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        use_streaming: bool = True,
-        use_thinking: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Make a call to Claude API.
+        event_type: EventType,
+        data: Dict[str, Any],
+    ) -> None:
+        """Emit a structured event via the event bus."""
+        event = Event(
+            event_type=event_type,
+            agent_id=self.agent_id,
+            data=data,
+            timestamp=datetime.utcnow().isoformat() + "Z",
+        )
+        await self.event_bus.publish(event)
 
-        TODO: Implement this method with:
-        - Streaming support
-        - Extended thinking support
-        - Tool use handling
-        - Event emission for UI updates
+    async def _emit_agent_started(self, message: str) -> None:
+        """Emit agent_started event."""
+        await self._emit_event(
+            EventType.AGENT_STARTED,
+            {
+                "message": message,
+                "agent_type": self.agent_type,
+            },
+        )
 
-        Args:
-            messages: Conversation messages
-            tools: Optional tools to enable
-            use_streaming: Whether to stream the response
-            use_thinking: Whether to enable extended thinking
-
-        Returns:
-            The response from Claude
-        """
-        # TODO: Implement Claude API call with streaming and events
-        raise NotImplementedError("Implement _call_claude method")
-
-    async def _handle_tool_use(
+    async def _emit_agent_completed(
         self,
-        tool_uses: List[Any]
-    ) -> List[Dict[str, Any]]:
+        summary: Optional[str] = None,
+    ) -> None:
+        """Emit agent_completed event."""
+        payload: Dict[str, Any] = {
+            "agent_type": self.agent_type,
+        }
+        if summary:
+            payload["summary"] = summary
+
+        await self._emit_event(EventType.AGENT_COMPLETED, payload)
+
+    async def _emit_thinking(self, content: str) -> None:
         """
-        Handle tool calls from Claude.
+        Emit a thinking event (streamed reasoning).
 
-        TODO: Implement tool execution with:
-        - Event emission for tool call start/result
-        - Error handling
-        - Timeout handling
+        This should be called incrementally.
+        """
+        await self._emit_event(
+            EventType.THINKING,
+            {
+                "content": content,
+            },
+        )
 
-        Args:
-            tool_uses: List of tool use blocks from Claude
+    async def _emit_tool_call_start(
+        self,
+        tool_name: str,
+        input_data: Dict[str, Any],
+        purpose: Optional[str] = None,
+    ) -> str:
+        """
+        Emit tool_call_start event.
 
         Returns:
-            List of tool results to send back
+            tool_call_id for correlation with result
         """
-        # TODO: Implement tool use handling
-        raise NotImplementedError("Implement _handle_tool_use method")
+        tool_call_id = f"{self.agent_id}_{tool_name}_{datetime.utcnow().timestamp()}"
 
-    async def _run_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Any:
-        """
-        Execute a specific tool.
+        await self._emit_event(
+            EventType.TOOL_CALL_START,
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "input": input_data,
+                "purpose": purpose,
+            },
+        )
 
-        Args:
-            tool_name: Name of the tool to run
-            tool_input: Input parameters for the tool
+        return tool_call_id
 
-        Returns:
-            Tool execution result
-        """
-        # TODO: Implement tool execution dispatch
-        raise NotImplementedError("Implement _run_tool method")
+    async def _emit_tool_call_result(
+        self,
+        tool_call_id: str,
+        output_data: Any,
+        duration_ms: Optional[int] = None,
+    ) -> None:
+        """Emit tool_call_result event."""
+        payload: Dict[str, Any] = {
+            "tool_call_id": tool_call_id,
+            "output": output_data,
+        }
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
 
-    def _emit_thinking(self, chunk: str) -> None:
-        """Emit a thinking event."""
-        event = create_thinking_event(self.agent_id, chunk)
-        self._publish_event(event)
+        await self._emit_event(EventType.TOOL_CALL_RESULT, payload)
 
-    def _emit_agent_started(self, task: str) -> None:
-        """Emit agent started event."""
-        event = create_agent_started_event(self.agent_id, self.agent_type, task)
-        self._publish_event(event)
+    async def _emit_finding(self, finding: Dict[str, Any]) -> None:
+        """Emit finding_discovered event."""
+        await self._emit_event(
+            EventType.FINDING_DISCOVERED,
+            finding,
+        )
 
-    def reset(self) -> None:
-        """Reset the agent's conversation history."""
-        self.messages = []
+    async def _emit_fix_proposed(self, fix: Dict[str, Any]) -> None:
+        """Emit fix_proposed event."""
+        await self._emit_event(
+            EventType.FIX_PROPOSED,
+            fix,
+        )
+
+    async def _emit_fix_verified(self, verification: Dict[str, Any]) -> None:
+        """Emit fix_verified event."""
+        await self._emit_event(
+            EventType.FIX_VERIFIED,
+            verification,
+        )
+
+    async def _emit_error(
+        self,
+        error_message: str,
+        recoverable: bool = True,
+        will_retry: bool = False,
+    ) -> None:
+        """Emit agent_error event."""
+        await self._emit_event(
+            EventType.AGENT_ERROR,
+            {
+                "message": error_message,
+                "recoverable": recoverable,
+                "will_retry": will_retry,
+            },
+        )
