@@ -1,0 +1,11 @@
+# Core runtime
+python-dotenv>=1.0.0
+
+# OpenAI LLM (Stage 3)
+openai>=1.30.0
+
+# Async + typing support (stdlib-compatible but explicit is fine)
+typing-extensions>=4.8.0
+
+# Optional but recommended for debugging / logs
+rich>=13.7.0
