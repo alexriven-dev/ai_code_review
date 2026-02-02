@@ -133,6 +133,24 @@ CODE:
         """
         self._specialists[agent_type] = agent
 
+    # ---------------------------------------------------------
+    # Result Consolidation
+    # ---------------------------------------------------------
+
+    def _consolidate_results(
+        self,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Consolidate findings from SharedContext.
+        """
+
+        shared_context = context.get("shared_context")
+
+        if not shared_context:
+            return {}
+
+        return shared_context.get_report()
 
 
     # ---------------------------------------------------------
@@ -166,7 +184,14 @@ CODE:
         # Step 3: Execute plan automatically
         await self._execute_plan(plan, code, context)
 
-        await self._emit_agent_completed("Analysis complete")
+        # Consolidate results
+        report = self._consolidate_results(context)
+
+        await self._emit_agent_completed(
+            summary=f"Analysis complete. Risk score: {report['risk_score']}"
+        )
+
+        return report
 
         return plan
 
