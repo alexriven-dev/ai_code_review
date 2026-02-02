@@ -1,211 +1,181 @@
 """
-Bug Detection Agent - Finds bugs and code quality issues.
+BugAgent - analyzes code for logic, runtime, and correctness issues.
 
-TODO: Implement the bug detection agent.
+Stage 4 compatible:
+- Uses OpenAI via LLM adapter
+- Enforces structured JSON output
+- Safely extracts JSON
+- Emits lifecycle + finding events
+- Integrates with SharedContext
 """
 
 from typing import Any, Dict, List, Optional
+import json
+import re
 
 from .base_agent import BaseAgent
-from ..config import config
-from ..events import EventBus
-from ..events.event_types import create_finding_event
+from ..llm.openai_client import OpenAIClient
+from ..context.shared_context import SharedContext
 
 
-class BugDetectionAgent(BaseAgent):
-    """
-    Bug detection specialist agent.
+class BugAgent(BaseAgent):
+    """Agent responsible for detecting bugs and logic errors."""
 
-    Focuses on:
-    - Null/None reference errors
-    - Off-by-one errors
-    - Resource leaks
-    - Race conditions
-    - Division by zero
-    - Unhandled exceptions
-    - Logic errors
-    - Type errors
-
-    TODO: Complete the implementation
-    """
-
-    # Bug categories this agent detects
-    BUG_CATEGORIES = [
-        "Null Reference",
-        "Off-by-One",
-        "Resource Leak",
-        "Race Condition",
-        "Division by Zero",
-        "Unhandled Exception",
-        "Logic Error",
-        "Type Error",
-        "Index Out of Bounds",
-        "Infinite Loop"
-    ]
-
-    def __init__(self, event_bus: EventBus):
+    def __init__(self, event_bus):
         super().__init__(
             agent_id="bug_agent",
             agent_type="bug",
-            agent_config=config.bug_agent_config,
-            event_bus=event_bus
+            agent_config={},
+            event_bus=event_bus,
         )
+
+        self._llm = OpenAIClient()
+
+    # ------------------------------------------------------------------
+    # System Prompt
+    # ------------------------------------------------------------------
 
     @property
     def system_prompt(self) -> str:
-        """System prompt for the bug detection agent."""
-        return """You are a Bug Detection Specialist Agent focused on finding bugs and code quality issues.
+        return (
+            "You are a software bug detection agent.\n"
+            "Your task is to identify real, high-confidence bugs,\n"
+            "logic errors, and runtime issues in Python code.\n\n"
+            "Focus on:\n"
+            "- Null/None errors\n"
+            "- Off-by-one mistakes\n"
+            "- Unhandled exceptions\n"
+            "- Resource leaks\n"
+            "- Type errors\n"
+            "- Logic flaws\n"
+            "- Index errors\n"
+            "- Infinite loops\n\n"
+            "Output Rules:\n"
+            "- Return ONLY valid JSON\n"
+            "- No explanations\n"
+            "- No markdown\n"
+            "- Output must start with [ and end with ]\n\n"
+            "If no issues exist, return: []"
+        )
 
-Your expertise includes:
-- Null/None References: Variables that might be None when accessed
-- Race Conditions: Concurrent access without proper synchronization
-- Resource Leaks: Files, connections, locks not properly closed
-- Division by Zero: Potential divide by zero scenarios
-- Off-by-One Errors: Loop bounds, array indices
-- Logic Errors: Incorrect conditions, wrong operators
-- Type Errors: Type mismatches, incorrect casts
-- Exception Handling: Unhandled or improperly handled exceptions
+    # ------------------------------------------------------------------
+    # Prompt Builder
+    # ------------------------------------------------------------------
 
-For each bug found:
-1. Identify the exact location (file, line numbers)
-2. Explain the bug and when it would manifest
-3. Rate severity based on impact (critical, high, medium, low)
-4. Provide a working fix
-5. Explain edge cases or scenarios that trigger the bug
+    def _build_user_prompt(self, code: str) -> str:
+        return f"""
+Analyze the following Python code for bugs and logic errors.
 
-Focus on bugs that could cause runtime errors, data corruption, or incorrect behavior.
-Avoid reporting style issues or minor improvements unless they could cause bugs.
+Return a JSON array. Each item must have exactly this format:
 
-IMPORTANT: Return findings in structured JSON format."""
+{{
+  "id": "string",
+  "category": "logic|runtime|performance|type|resource",
+  "severity": "critical|high|medium|low",
+  "description": "string",
+  "line": number | null
+}}
 
-    def get_tools(self) -> List[Dict[str, Any]]:
-        """Tools available to the bug agent."""
-        return [
-            {
-                "name": "trace_data_flow",
-                "description": "Trace the flow of a variable through the code to find potential issues",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "variable_name": {
-                            "type": "string",
-                            "description": "The variable to trace"
-                        },
-                        "code": {
-                            "type": "string",
-                            "description": "The code to analyze"
-                        }
-                    },
-                    "required": ["variable_name", "code"]
-                }
-            },
-            {
-                "name": "check_null_safety",
-                "description": "Check if a code section properly handles null/None values",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "code_section": {
-                            "type": "string",
-                            "description": "The code to check"
-                        }
-                    },
-                    "required": ["code_section"]
-                }
-            },
-            {
-                "name": "analyze_concurrency",
-                "description": "Analyze code for race conditions and thread safety issues",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "code": {
-                            "type": "string",
-                            "description": "The code to analyze"
-                        }
-                    },
-                    "required": ["code"]
-                }
-            },
-            {
-                "name": "propose_fix",
-                "description": "Propose a fix for a discovered bug",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "bug": {
-                            "type": "object",
-                            "description": "The bug to fix"
-                        },
-                        "code_context": {
-                            "type": "string",
-                            "description": "Surrounding code context"
-                        }
-                    },
-                    "required": ["bug", "code_context"]
-                }
-            }
-        ]
+Rules:
+- Do not add explanations
+- Do not add comments
+- Do not wrap in markdown
+- Do not output anything except JSON
+
+If there are no issues, return [].
+
+CODE:
+{code}
+"""
+
+    # ------------------------------------------------------------------
+    # JSON Extraction
+    # ------------------------------------------------------------------
+
+    def _extract_json_array(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Extract first JSON array from LLM output.
+        """
+
+        # Fast path
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+
+        # Fallback
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+
+        if not match:
+            raise ValueError("No JSON array found in response")
+
+        return json.loads(match.group())
+
+    # ------------------------------------------------------------------
+    # Main Analysis
+    # ------------------------------------------------------------------
 
     async def analyze(
         self,
         code: str,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Analyze code for bugs.
-
-        TODO: Implement bug detection:
-        1. Emit agent_started event
-        2. Parse and understand the code
-        3. Check for each bug category
-        4. Emit finding_discovered event for each finding
-        5. Propose fixes for found bugs
-        6. Return structured results
-
-        Args:
-            code: The code to analyze
-            context: Optional context from coordinator
-                    (e.g., security findings to avoid duplication)
-
-        Returns:
-            Dictionary with findings and proposed fixes
+        Analyze code for bugs and logic errors.
         """
-        self._emit_agent_started("Analyzing code for bugs and issues")
 
-        # TODO: Implement bug detection
-        # Use Claude to analyze the code
-        # Emit events as findings are discovered
-        # Return structured results
+        await self._emit_agent_started("Starting bug analysis")
 
-        raise NotImplementedError("Implement bug detection analysis")
+        shared_context: Optional[SharedContext] = None
+        if context and "shared_context" in context:
+            shared_context = context["shared_context"]
 
-    def _emit_finding(
-        self,
-        finding_id: str,
-        severity: str,
-        category: str,
-        title: str,
-        description: str,
-        line_start: int,
-        line_end: int,
-        code_snippet: str,
-        confidence: float = 1.0
-    ) -> None:
-        """Helper to emit a finding event."""
-        event = create_finding_event(
-            agent_id=self.agent_id,
-            finding_id=finding_id,
-            finding_type="bug",
-            severity=severity,
-            title=title,
-            description=description,
-            location={
-                "line_start": line_start,
-                "line_end": line_end,
-                "code_snippet": code_snippet
-            },
-            confidence=confidence
+        await self._emit_thinking("Analyzing code for bugs and logic flaws")
+
+        user_prompt = self._build_user_prompt(code)
+
+        raw_response = await self._llm.generate(
+            system_prompt=self.system_prompt,
+            user_prompt=user_prompt,
         )
-        event.data["category"] = category
-        self._publish_event(event)
+
+        # --------------------------------------------------------------
+        # Parse response safely
+        # --------------------------------------------------------------
+
+        try:
+            findings: List[Dict[str, Any]] = self._extract_json_array(
+                raw_response
+            )
+
+        except Exception as e:
+            await self._emit_error(
+                f"BugAgent failed to parse LLM JSON: {e}. "
+                f"Raw response: {raw_response[:300]}",
+                recoverable=False,
+            )
+            findings = []
+
+        # --------------------------------------------------------------
+        # Post-process findings
+        # --------------------------------------------------------------
+
+        for finding in findings:
+
+            finding["agent_id"] = self.agent_id
+            finding["agent_type"] = self.agent_type
+
+            await self._emit_finding(finding)
+
+            if shared_context:
+                shared_context.add_finding(finding)
+
+        await self._emit_agent_completed(
+            summary=f"Found {len(findings)} bug(s)"
+        )
+
+        return {
+            "findings": findings,
+        }

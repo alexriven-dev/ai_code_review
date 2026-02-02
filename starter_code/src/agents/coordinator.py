@@ -17,174 +17,314 @@ from ..config import config
 from ..events import EventBus, EventType, Event
 
 
+import asyncio
+import json
+from typing import Dict, Any, List, Set
+
+from .base_agent import BaseAgent
+from ..events import EventType
+from ..llm.openai_client import OpenAIClient
+
+
+
 class CoordinatorAgent(BaseAgent):
     """
-    Coordinator agent that orchestrates the code review process.
-
-    Responsibilities:
-    - Create analysis plan
-    - Delegate to specialist agents
-    - Consolidate findings
-    - Manage fix verification workflow
-    - Generate final report
+    Coordinator agent responsible for:
+    - Planning
+    - Scheduling
+    - Executing workflow steps
     """
 
-    def __init__(self, event_bus: EventBus):
+    def __init__(self, event_bus):
         super().__init__(
             agent_id="coordinator",
             agent_type="coordinator",
-            agent_config=config.coordinator_config,
+            agent_config={},
             event_bus=event_bus,
         )
 
-        # Registered specialist agents (security, bug, etc.)
+        # LLM client for planning
+        self._llm = OpenAIClient()
+
+        # Maps agent_type -> agent instance
         self._specialists: Dict[str, BaseAgent] = {}
 
-        # Current analysis state
-        self._current_plan: Optional[Dict[str, Any]] = None
-        self._all_findings: List[Dict[str, Any]] = []
+
+
+        # ---------------------------------------------------------
+        # System Prompt (Required by BaseAgent)
+        # ---------------------------------------------------------
 
     @property
     def system_prompt(self) -> str:
-        """System prompt for the coordinator."""
-        return """You are a Coordinator Agent responsible for orchestrating a multi-agent code review system."""
+        return (
+            "You are a coordination and planning agent.\n"
+            "Your task is to analyze code review requests and\n"
+            "break them into structured analysis steps.\n\n"
+            "You create execution plans for specialist agents."
+        )
 
-    def get_tools(self) -> List[Dict[str, Any]]:
-        """Tools available to the coordinator (used in later stages)."""
-        return []
+
+        # ---------------------------------------------------------
+        # LLM-Based Planner
+        # ---------------------------------------------------------
+
+    async def _plan_with_llm(
+            self,
+            code: str,
+            context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Generate execution plan using LLM.
+        """
+
+        system_prompt = self.system_prompt
+
+        user_prompt = f"""
+Analyze the following code review task and create an execution plan.
+
+Return STRICTLY valid JSON in this format:
+
+{{
+  "plan_id": "string",
+  "steps": [
+    {{
+      "step_id": "string",
+      "agent_type": "security|bug",
+      "description": "string",
+      "depends_on": [],
+      "can_run_parallel": true,
+      "timeout_seconds": 60
+    }}
+  ]
+}}
+
+Rules:
+- Do not add explanations
+- Do not add markdown
+- Do not add extra text
+- Output must be JSON only
+
+CODE:
+{code}
+"""
+
+        raw_response = await self._llm.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+
+        # Safe parse
+        try:
+            plan = json.loads(raw_response)
+
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to parse coordinator plan JSON: {e}. "
+                f"Response: {raw_response[:300]}"
+            )
+
+        return plan
+
 
     def register_specialist(self, agent_type: str, agent: BaseAgent) -> None:
         """
-        Register a specialist agent.
-
-        Args:
-            agent_type: Type of specialist (e.g. 'security', 'bug')
-            agent: The agent instance
+        Register specialist agent.
         """
         self._specialists[agent_type] = agent
+
+
+
+    # ---------------------------------------------------------
+    # Main Entry Point
+    # ---------------------------------------------------------
 
     async def analyze(
         self,
         code: str,
-        context: Optional[Dict[str, Any]] = None,
+        context: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Stage 1: Orchestrate planning for the code analysis.
+        Main coordinator entry.
 
-        Current implementation:
-        1. Emit agent_started
-        2. Create analysis plan
-        3. Emit plan_created
-        4. Emit agent_delegated for each specialist
-        5. STOP (no execution yet)
-
-        Args:
-            code: The code to analyze
-            context: Optional additional context
-
-        Returns:
-            The generated analysis plan
+        1. Create plan
+        2. Execute plan
+        3. Return results
         """
-        self._emit_agent_started("Creating analysis plan")
 
-        if not code or not code.strip():
-            raise ValueError("Coordinator received empty code input.")
+        await self._emit_agent_started("Creating analysis plan")
 
-        # Stage 1: Create plan
-        plan = await self._create_plan(code)
-        self._current_plan = plan
+        # Step 1: Create plan (existing logic)
+        plan = await self._create_plan(code, context)
 
-        # Emit delegation events for each planned step
-        for step in plan["steps"]:
-            event = Event(
-                event_type=EventType.AGENT_DELEGATED,
-                agent_id=self.agent_id,
-                data={
-                    "plan_id": plan["plan_id"],
-                    "step_id": step["step_id"],
-                    "agent_type": step["agent_type"],
-                    "description": step["description"],
-                },
-            )
-            await self.event_bus.publish(event)
-
-        # Stage 1 ends here intentionally
-        return plan
-
-    async def _create_plan(self, code: str) -> Dict[str, Any]:
-        """
-        Create an analysis plan for the code.
-
-        Stage 1 behavior:
-        - Deterministic plan
-        - Always include security and bug agents
-        - Run in parallel
-
-        Args:
-            code: The code to analyze
-
-        Returns:
-            Plan dictionary
-        """
-        plan: Dict[str, Any] = {
-            "plan_id": self._generate_plan_id(),
-            "steps": [
-                {
-                    "step_id": "security_analysis",
-                    "agent_type": "security",
-                    "description": "Analyze code for security vulnerabilities",
-                    "depends_on": [],
-                    "can_run_parallel": True,
-                    "timeout_seconds": 60,
-                },
-                {
-                    "step_id": "bug_analysis",
-                    "agent_type": "bug",
-                    "description": "Analyze code for bugs and logic errors",
-                    "depends_on": [],
-                    "can_run_parallel": True,
-                    "timeout_seconds": 60,
-                },
-            ],
-        }
-
-        # Emit plan_created event
-        event = Event(
-            event_type=EventType.PLAN_CREATED,
-            agent_id=self.agent_id,
-            data=plan,
+        # Step 2: Emit plan created
+        await self._emit_event(
+            EventType.PLAN_CREATED,
+            plan,
         )
-        await self.event_bus.publish(event)
+
+        # Step 3: Execute plan automatically
+        await self._execute_plan(plan, code, context)
+
+        await self._emit_agent_completed("Analysis complete")
 
         return plan
 
-    async def _consolidate_findings(
+    # ---------------------------------------------------------
+    # Planning (Existing Logic Wrapper)
+    # ---------------------------------------------------------
+
+    async def _create_plan(
         self,
-        findings: List[Dict[str, Any]],
+        code: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Wrapper around existing planning logic.
+        """
+
+        # Call your existing LLM-based planner
+        return await self._plan_with_llm(code, context)
+
+    # ---------------------------------------------------------
+    # Scheduler / Executor
+    # ---------------------------------------------------------
+
+    async def _execute_plan(
+        self,
+        plan: Dict[str, Any],
+        code: str,
+        context: Dict[str, Any],
+    ) -> None:
+        """
+        Execute plan with dependency-aware scheduling.
+        """
+
+        steps: List[Dict[str, Any]] = plan.get("steps", [])
+
+        # Track completed steps
+        completed: Set[str] = set()
+
+        # Track running tasks
+        running: Dict[str, asyncio.Task] = {}
+
+        while len(completed) < len(steps):
+
+            # Find steps ready to run
+            ready_steps = self._find_ready_steps(
+                steps,
+                completed,
+                running,
+            )
+
+            # Schedule ready steps
+            for step in ready_steps:
+                task = asyncio.create_task(
+                    self._run_step(step, code, context)
+                )
+
+                running[step["step_id"]] = task
+
+            if not running:
+                raise RuntimeError("Deadlock detected in plan execution")
+
+            # Wait for any step to complete
+            done, _ = await asyncio.wait(
+                running.values(),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Process completed tasks
+            for finished in done:
+
+                step_id = None
+
+                for sid, task in running.items():
+                    if task == finished:
+                        step_id = sid
+                        break
+
+                if step_id is None:
+                    continue
+
+                await finished  # propagate errors
+
+                completed.add(step_id)
+                del running[step_id]
+
+    # ---------------------------------------------------------
+    # Step Selection
+    # ---------------------------------------------------------
+
+    def _find_ready_steps(
+        self,
+        steps: List[Dict[str, Any]],
+        completed: Set[str],
+        running: Dict[str, asyncio.Task],
     ) -> List[Dict[str, Any]]:
         """
-        Consolidate findings from all agents.
-
-        Implemented in later stages.
+        Find steps whose dependencies are satisfied.
         """
-        raise NotImplementedError("Finding consolidation not implemented yet.")
 
-    async def _verify_fix(
+        ready = []
+
+        for step in steps:
+
+            step_id = step["step_id"]
+
+            # Skip finished or running
+            if step_id in completed or step_id in running:
+                continue
+
+            deps = step.get("depends_on", [])
+
+            # Check dependencies
+            if all(dep in completed for dep in deps):
+                ready.append(step)
+
+        return ready
+
+    # ---------------------------------------------------------
+    # Step Runner
+    # ---------------------------------------------------------
+
+    async def _run_step(
         self,
-        original_code: str,
-        fixed_code: str,
-        finding: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        step: Dict[str, Any],
+        code: str,
+        context: Dict[str, Any],
+    ) -> None:
         """
-        Verify a proposed fix.
-
-        Implemented in later stages.
+        Run a single workflow step.
         """
-        raise NotImplementedError("Fix verification not implemented yet.")
 
-    @staticmethod
-    def _generate_plan_id() -> str:
-        """Generate a simple unique plan identifier."""
-        from uuid import uuid4
+        step_id = step["step_id"]
+        agent_type = step["agent_type"]
 
-        return str(uuid4())
+        # Emit step started
+        await self._emit_event(
+            EventType.PLAN_STEP_STARTED,
+            {
+                "step_id": step_id,
+                "agent_type": agent_type,
+            },
+        )
+
+        # Lookup agent
+        agent = self._specialists.get(agent_type)
+
+        if not agent:
+            raise RuntimeError(f"No specialist for {agent_type}")
+
+        # Run specialist
+        await agent.analyze(code, context)
+
+        # Emit step completed
+        await self._emit_event(
+            EventType.PLAN_STEP_COMPLETED,
+            {
+                "step_id": step_id,
+                "agent_type": agent_type,
+            },
+        )
+

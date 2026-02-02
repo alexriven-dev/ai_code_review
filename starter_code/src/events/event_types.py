@@ -6,7 +6,7 @@ See STREAMING_EVENTS_SPEC.md for full event schema documentation.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
+from enum import Enum, auto
 from typing import Any, Dict, Optional
 import uuid
 
@@ -23,6 +23,7 @@ class EventType(Enum):
     AGENT_STARTED = "agent_started"
     AGENT_COMPLETED = "agent_completed"
     AGENT_ERROR = "agent_error"
+    AGENT_DELEGATED = "agent_delegated"
 
     # Thinking/reasoning events
     THINKING = "thinking"

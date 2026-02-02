@@ -10,6 +10,7 @@ BaseAgent - shared lifecycle, event emission, and utilities for all agents.
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+import asyncio
 
 from ..events import EventBus, EventType, Event
 
